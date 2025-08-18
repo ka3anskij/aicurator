@@ -1,0 +1,13 @@
+user_id,timestamp,event_type,duration_min,score,info
+user1@example.com,2025-08-17T21:00:00,login,8,,
+user1@example.com,2025-08-17T21:05:00,lesson_completed,25,,
+user1@example.com,2025-08-16T21:00:00,quiz,10,82,
+user2@example.com,2025-07-29T21:00:00,login,5,,
+user2@example.com,2025-07-29T21:05:00,quiz,7,40,
+user3@example.com,2025-07-14T21:00:00,login,2,,
+user3@example.com,2025-07-13T21:00:00,lesson_completed,12,,
+user4@example.com,2025-08-15T21:00:00,login,3,,
+user4@example.com,2025-07-22T21:00:00,login,4,,
+user5@example.com,2025-08-17T20:00:00,quiz,12,45,
+user5@example.com,2025-08-16T20:00:00,login,6,,
+user5@example.com,2025-08-13T20:00:00,lesson_completed,30,,

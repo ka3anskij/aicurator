@@ -1,0 +1,6 @@
+{
+  "feature_window_days": 28,
+  "horizon_days": 14,
+  "threshold": 0.3,
+  "notify_top_n": 20
+}
