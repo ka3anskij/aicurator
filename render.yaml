@@ -2,17 +2,17 @@ services:
   - type: worker
     name: lms-churn-bot
     env: docker
-    plan: free
     autoDeploy: true
     dockerfilePath: ./Dockerfile
+    startCommand: python tg_churn_bot.py
     envVars:
       - key: TG_TOKEN
-        sync: false
+        sync: false      # поставь в Dashboard
       - key: MODEL_PATH
         value: /app/prod_lms_dropout_model.pkl
       - key: CONFIG_PATH
         value: /app/prod_lms_dropout_config.json
-      - key: DATA_DIR
-        value: /tmp/uploads
-      - key: RUNNER_PATH
-        value: /app/lms_churn_prod.py
+      - key: EXPORT_DIR
+        value: /app/uploads
+      - key: PYTHONUNBUFFERED
+        value: "1"
