@@ -1,599 +1,635 @@
+import os
+import io
+import re
+import csv
+import sys
+import json
+import math
+import zipfile
 import asyncio
 import logging
-import os
-import re
-import shutil
-from datetime import datetime
-from pathlib import Path
-from typing import List, Tuple
+from datetime import datetime, timezone
+from typing import Optional, List, Dict
 
 import pandas as pd
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pandas.api.types import is_datetime64_any_dtype as is_datetime, is_numeric_dtype
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    constants,
+    Message,
 )
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
-    CallbackContext,
+    ContextTypes,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     filters,
 )
 
-# -------------------- Settings --------------------
-
-TOKEN = os.getenv("TG_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Set TG_TOKEN env var.")
-
-UPLOAD_DIR = Path(os.getenv("DATA_DIR", "./uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-MODEL_PATH = os.getenv("MODEL_PATH", "prod_lms_dropout_model.pkl")
-CONFIG_PATH = os.getenv("CONFIG_PATH", "prod_lms_dropout_config.json")
-
-DEFAULT_THRESHOLD = float(os.getenv("THRESHOLD", "0.35"))
-DEFAULT_TOPN = int(os.getenv("TOP_N", "20"))
-
-# включить, если хочешь дергать внешний раннер вместо встроенного эвристического
-USE_EXTERNAL_RUNNER = False  # <-- можно переключить на True, если есть CLI/модуль
-
-# -------------------- Logging --------------------
+# =========================
+# CONFIG & GLOBALS
+# =========================
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
-# -------------------- Small helpers --------------------
+TG_TOKEN = os.getenv("TG_TOKEN")
+if not TG_TOKEN:
+    raise RuntimeError("Set TG_TOKEN env var.")
+
+UPLOADS_DIR = os.getenv("DATA_DIR", "/tmp/uploads")
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/prod_lms_dropout_model.pkl")
+CONFIG_PATH = os.getenv("CONFIG_PATH", "/app/prod_lms_dropout_config.json")
+
+# runtime конфиг (хранится в памяти процесса)
+RISK_THRESHOLD = float(os.getenv("RISK_THRESHOLD", "0.35"))
+NOTIFY_TOP_N = int(os.getenv("NOTIFY_TOP_N", "20"))
+
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+EMAIL_PAT = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", re.I)
+
+COL_SYNONYMS = {
+    "email": ["email", "e-mail", "mail", "почта", "user_email", "login_email", "username"],
+    "user_id": ["user_id", "userid", "id", "uid", "account_id"],
+    "last_event_at": [
+        "last_event_at", "last_activity", "last_seen", "updated_at",
+        "last_event_time", "последняя_активность", "last_login"
+    ],
+    "events_28d": ["events_28d", "events28", "events_last_28d", "activity_28d", "count_28d", "activity_count_28d"],
+    "quiz_avg": ["quiz_avg", "avg_quiz", "quiz_score", "score_avg", "avg_score", "mean_quiz"],
+}
+
+REQUIRED_ROLES = ["email", "last_event_at"]
+OPTIONAL_ROLES = ["events_28d", "quiz_avg", "user_id"]
 
 
-def kb_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🚀 Запустить /run", callback_data="RUN"),
-                InlineKeyboardButton("📊 Статус", callback_data="STATUS"),
-            ],
-            [
-                InlineKeyboardButton("⚙️ Порог риска", callback_data="SET_THR"),
-                InlineKeyboardButton("🔝 Top-N", callback_data="SET_TOPN"),
-            ],
-            [
-                InlineKeyboardButton("🧹 Очистить выгрузки", callback_data="CLEAR"),
-                InlineKeyboardButton("ℹ️ Помощь", callback_data="HELP"),
-            ],
-        ]
-    )
+# =========================
+# UTILS: FILES & DATA
+# =========================
+
+def has_data() -> bool:
+    if not os.path.isdir(UPLOADS_DIR):
+        return False
+    for _, _, files in os.walk(UPLOADS_DIR):
+        for f in files:
+            if f.lower().endswith((".csv", ".xlsx", ".xls", ".zip")):
+                return True
+    return False
 
 
-def kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="HOME")]])
+def _normalize_columns(cols):
+    norm = []
+    for c in cols:
+        x = str(c).strip().lower()
+        x = x.replace(" ", "_").replace("-", "_")
+        norm.append(x)
+    return norm
 
 
-def fmt_ok(text: str) -> str:
-    return f"✅ <b>{text}</b>"
+def read_any_table(path: str) -> List[pd.DataFrame]:
+    """
+    Возвращает список DF из файла (CSV/XLSX/ZIP).
+    """
+    dfs: List[pd.DataFrame] = []
 
-
-def fmt_warn(text: str) -> str:
-    return f"⚠️ <b>{text}</b>"
-
-
-def fmt_err(text: str) -> str:
-    return f"❌ <b>{text}</b>"
-
-
-def human_ts(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def latest_file_in_uploads() -> Path | None:
-    files = sorted(
-        [p for p in UPLOAD_DIR.glob("*") if p.is_file()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return files[0] if files else None
-
-
-def parse_float(s: str) -> float | None:
-    try:
-        return float(s.replace(",", "."))
-    except Exception:
+    def _read_csv_bytes(b: bytes) -> Optional[pd.DataFrame]:
+        for enc in ("utf-8-sig", "utf-8", "cp1251"):
+            for sep in (",", ";", "\t", "|"):
+                try:
+                    df = pd.read_csv(io.BytesIO(b), encoding=enc, sep=sep, engine="python")
+                    if df.shape[1] > 0:
+                        return df
+                except Exception:
+                    continue
         return None
 
+    low = path.lower()
 
-# -------------------- UX: progress / errors --------------------
+    if low.endswith((".xlsx", ".xls")):
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            df = xls.parse(sheet)
+            df.columns = _normalize_columns(df.columns)
+            dfs.append(df)
+        return dfs
+
+    if low.endswith(".zip"):
+        with zipfile.ZipFile(path) as z:
+            for name in z.namelist():
+                nlow = name.lower()
+                if not nlow.endswith((".csv", ".xlsx", ".xls")):
+                    continue
+                data = z.read(name)
+                if nlow.endswith((".xlsx", ".xls")):
+                    bio = io.BytesIO(data)
+                    xls = pd.ExcelFile(bio)
+                    for sheet in xls.sheet_names:
+                        df = xls.parse(sheet)
+                        df.columns = _normalize_columns(df.columns)
+                        dfs.append(df)
+                else:
+                    df = _read_csv_bytes(data)
+                    if df is not None:
+                        df.columns = _normalize_columns(df.columns)
+                        dfs.append(df)
+        return dfs
+
+    # csv
+    with open(path, "rb") as f:
+        b = f.read()
+    df = _read_csv_bytes(b)
+    if df is not None:
+        df.columns = _normalize_columns(df.columns)
+        dfs.append(df)
+    return dfs
 
 
-async def run_with_progress(
-    update: Update,
-    context: CallbackContext,
-    title: str,
-    coro,
-) -> None:
-    """
-    Показывает анимированный прогресс, параллельно исполняя coro().
-    Любые исключения ловим и печатаем пользователю.
-    """
-    chat_id = update.effective_chat.id
-    frames = ["⏳", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚"]
-    i = 0
-    started = datetime.now()
+def _guess_col_by_synonyms(df: pd.DataFrame, role: str) -> Optional[str]:
+    syns = COL_SYNONYMS.get(role, [])
+    for s in syns:
+        if s in df.columns:
+            return s
+    return None
 
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"{frames[i]} <b>{title}</b>\n<i>идёт обработка…</i>",
-        parse_mode=constants.ParseMode.HTML,
-        reply_markup=kb_back(),
-    )
 
-    async def spinner():
-        nonlocal i
-        while True:
-            i = (i + 1) % len(frames)
-            elapsed = (datetime.now() - started).seconds
-            try:
-                await msg.edit_text(
-                    f"{frames[i]} <b>{title}</b>\n<i>идёт обработка… {elapsed}s</i>",
-                    parse_mode=constants.ParseMode.HTML,
-                    reply_markup=kb_back(),
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(1.2)
+def _guess_email_col(df: pd.DataFrame) -> Optional[str]:
+    col = _guess_col_by_synonyms(df, "email")
+    if col:
+        return col
+    for c in df.columns:
+        series = df[c].astype(str).str.strip()
+        sample = series.dropna().head(200)
+        if not len(sample):
+            continue
+        m = (sample.str.match(EMAIL_PAT, na=False)).mean()
+        if m >= 0.5:
+            return c
+    return None
 
-    spin_task = asyncio.create_task(spinner())
+
+def _coerce_datetime(series: pd.Series) -> pd.Series:
     try:
-        result_text = await coro()
-        await msg.edit_text(
-            result_text, parse_mode=constants.ParseMode.HTML, reply_markup=kb_home()
-        )
-    except Exception as e:
-        log.exception("Run failed")
-        await msg.edit_text(
-            fmt_err("Ошибка во время обработки")
-            + "\n\n"
-            + f"<code>{type(e).__name__}: {e}</code>",
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=kb_home(),
-        )
-    finally:
-        spin_task.cancel()
+        s = pd.to_datetime(series, errors="coerce", utc=False, infer_datetime_format=True)
+        return s
+    except Exception:
+        return pd.to_datetime(series, errors="coerce")
 
 
-# -------------------- Domain: scoring --------------------
+def _guess_datetime_col(df: pd.DataFrame) -> Optional[str]:
+    col = _guess_col_by_synonyms(df, "last_event_at")
+    if col:
+        return col
+    best, best_rate = None, 0
+    for c in df.columns:
+        s = _coerce_datetime(df[c])
+        rate = s.notna().mean()
+        if rate > 0.5 and rate > best_rate:
+            best, best_rate = c, rate
+    return best
 
-def _read_any(path: Path) -> pd.DataFrame:
-    if path.suffix.lower() in {".xlsx", ".xls"}:
-        return pd.read_excel(path)
-    return pd.read_csv(path)
+
+def _guess_numeric_col(df: pd.DataFrame, role: str) -> Optional[str]:
+    col = _guess_col_by_synonyms(df, role)
+    if col:
+        return col
+    best, best_rate = None, 0
+    for c in df.columns:
+        s = pd.to_numeric(df[c], errors="coerce")
+        rate = s.notna().mean()
+        if rate > 0.5 and rate > best_rate:
+            best, best_rate = c, rate
+    return best
 
 
-def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    # пытаемся угадать колонки
-    cols = {c.lower(): c for c in df.columns}
-    # email
-    email_col = next((cols[k] for k in cols if "email" in k or "mail" in k), None)
-    # дни без активности
-    days_col = next(
-        (cols[k] for k in cols if "days" in k and ("last" in k or "inactive" in k)), None
-    )
-    if not days_col:
-        days_col = next((cols[k] for k in cols if "days_since" in k), None)
-    # события за 28 дней
-    ev28_col = next(
-        (cols[k] for k in cols if ("28" in k and "event" in k) or "events_28" in k), None
-    )
-    # средний квиз
-    quiz_col = next(
-        (cols[k] for k in cols if ("quiz" in k or "score" in k) and "avg" in k), None
-    )
+def infer_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    mapping = {
+        "email": _guess_email_col(df),
+        "last_event_at": _guess_datetime_col(df),
+        "events_28d": _guess_numeric_col(df, "events_28d"),
+        "quiz_avg": _guess_numeric_col(df, "quiz_avg"),
+        "user_id": _guess_numeric_col(df, "user_id") or _guess_col_by_synonyms(df, "user_id"),
+    }
+    return mapping
 
-    # fallback: популярные имена
-    email_col = email_col or cols.get("email") or cols.get("user_email")
-    days_col = days_col or cols.get("days_since_last_activity") or cols.get("days_since")
-    ev28_col = ev28_col or cols.get("events_28d") or cols.get("events_last_28d")
-    quiz_col = quiz_col or cols.get("quiz_avg") or cols.get("avg_quiz")
 
-    missing = [n for n in ("email", "days", "events28", "quiz") if locals()[f"{n}_col"] is None]
-    if missing:
-        raise ValueError(
-            f"Не нашёл необходимые колонки: {', '.join(missing)}. "
-            f"Колонки в файле: {list(df.columns)}"
-        )
+def validate_mapping(mapping: Dict[str, Optional[str]]):
+    missing = [r for r in REQUIRED_ROLES if not mapping.get(r)]
+    return (len(missing) == 0, missing)
 
-    out = pd.DataFrame(
-        {
-            "email": df[email_col].astype(str),
-            "days_since": pd.to_numeric(df[days_col], errors="coerce").fillna(0).astype(int),
-            "events_28d": pd.to_numeric(df[ev28_col], errors="coerce").fillna(0).astype(int),
-            "quiz_avg": pd.to_numeric(df[quiz_col], errors="coerce").fillna(0.0),
-        }
-    )
+
+def normalize_df(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["email"] = df[mapping["email"]].astype(str).str.strip()
+    out["last_event_at"] = _coerce_datetime(df[mapping["last_event_at"]])
+    if mapping.get("events_28d"):
+        out["events_28d"] = pd.to_numeric(df[mapping["events_28d"]], errors="coerce").fillna(0)
+    else:
+        out["events_28d"] = 0
+    if mapping.get("quiz_avg"):
+        q = pd.to_numeric(df[mapping["quiz_avg"]], errors="coerce")
+        out["quiz_avg"] = q.apply(lambda x: x/100 if 1 < x <= 1000 else x).fillna(0).clip(0, 100)
+    else:
+        out["quiz_avg"] = 0
+    if mapping.get("user_id"):
+        out["user_id"] = df[mapping["user_id"]].astype(str)
+    else:
+        out["user_id"] = out["email"]
+
+    # фильтры
+    out = out[out["email"].str.match(EMAIL_PAT, na=False)]
+    out = out[out["last_event_at"].notna()]
+    out = out[out["last_event_at"] <= pd.Timestamp.now(tz=None)]
     return out
 
 
-def _rule_score(row) -> float:
-    # простая интерпретируемая эвристика
-    s = 0.0
-    # давность
-    if row.days_since >= 60:
-        s += 0.65
-    elif row.days_since >= 40:
-        s += 0.5
-    elif row.days_since >= 20:
-        s += 0.35
-    # события
-    if row.events_28d <= 0:
-        s += 0.25
-    elif row.events_28d <= 2:
-        s += 0.15
-    elif row.events_28d <= 5:
-        s += 0.1
-    # квизы
-    if row.quiz_avg < 40:
-        s += 0.2
-    elif 40 <= row.quiz_avg < 60:
-        s += 0.1
-    else:
-        s -= 0.05
-    return max(0.0, min(1.0, s))
+def load_current_batch(upload_dir: str) -> Optional[pd.DataFrame]:
+    all_paths = []
+    for root, _, files in os.walk(upload_dir):
+        for f in files:
+            if f.lower().endswith((".csv", ".xlsx", ".xls", ".zip")):
+                all_paths.append(os.path.join(root, f))
+    if not all_paths:
+        return None
 
-
-def _reasons(row) -> List[str]:
-    rs = []
-    if row.days_since >= 1:
-        rs.append(f"нет активности {row.days_since}дн")
-    if row.events_28d <= 5:
-        rs.append(f"мало событий за 28д ({row.events_28d})")
-    if row.quiz_avg <= 60:
-        rs.append(f"низкие квизы (avg ~{int(round(row.quiz_avg))})")
-    return rs
-
-
-def run_builtin_scoring(threshold: float, top_n: int) -> Tuple[str, int]:
-    path = latest_file_in_uploads()
-    if not path:
-        raise FileNotFoundError("Не найдено ни одной выгрузки в /uploads")
-
-    df = _normalize_cols(_read_any(path))
-    df["p"] = df.apply(_rule_score, axis=1)
-    df.sort_values("p", ascending=False, inplace=True)
-
-    # алёрты
-    alerted = df[df["p"] >= threshold].head(top_n)
-    total = len(df)
-    lines = [f"🔔 Всего алёртов: <b>{len(alerted)}/{total}</b>"]
-    idx = 1
-    for _, r in alerted.iterrows():
-        reasons = "; ".join(_reasons(r))
-        lines.append(f"{idx}. <code>{r.email}</code> — p={r.p:.2f} — {reasons}")
-        idx += 1
-
-    if len(alerted) == 0:
-        lines.append("Порог слишком высокий? Попробуй понизить командой <code>/set_threshold 0.3</code>")
-
-    header = f"<b>Файл:</b> {path.name} ({human_ts(path.stat().st_mtime)})"
-    return header + "\n\n" + "\n".join(lines), len(alerted)
-
-
-async def run_external_runner(threshold: float, top_n: int) -> Tuple[str, int]:
-    """
-    Заглушка на случай, если хочешь использовать ваш продовый раннер.
-    Тут можно сделать subprocess или импорт модуля.
-    Пока возвращаем None -> чтобы не ломать бот, используем builtin.
-    """
-    raise NotImplementedError
-
-
-# -------------------- Bot state --------------------
-
-STATE = {
-    "threshold": DEFAULT_THRESHOLD,
-    "top_n": DEFAULT_TOPN,
-}
-
-SCHED = AsyncIOScheduler()
-
-
-# -------------------- Handlers --------------------
-
-async def on_start(update: Update, context: CallbackContext):
-    await update.message.reply_html(
-        "Привет! Я бот алёртов по оттоку LMS.\n"
-        "Пришли CSV/XLSX выгрузки, я их сохраню.\n\n"
-        "Нажимай кнопки ниже или используй команды.\n",
-        reply_markup=kb_home(),
-    )
-
-
-async def on_help(update: Update, context: CallbackContext):
-    await update.effective_message.reply_html(
-        "<b>Команды</b>\n"
-        "/run — запустить скоринг по последним выгрузкам\n"
-        "/status — конфиг и текущая папка\n"
-        "/set_threshold &lt;0..1&gt;\n"
-        "/set_notify_top_n &lt;N&gt;\n"
-        "/schedule_every &lt;days&gt; &lt;HH:MM&gt;\n"
-        "/cancel_schedule — отменить расписание\n"
-        "/clear_uploads — удалить старые выгрузки\n"
-        "/version — версия бота",
-        reply_markup=kb_home(),
-    )
-
-
-async def on_version(update: Update, context: CallbackContext):
-    await update.effective_message.reply_html(
-        "tg-bot: <b>progress-enabled v2</b>", reply_markup=kb_home()
-    )
-
-
-async def on_status(update: Update, context: CallbackContext):
-    lf = latest_file_in_uploads()
-    text = [
-        "<b>Статус:</b>",
-        f"Model: <code>{MODEL_PATH}</code>",
-        f"Config: <code>{CONFIG_PATH}</code> (ok)",
-        f"Exports: <code>{UPLOAD_DIR}</code>",
-        f"Threshold: <b>{STATE['threshold']:.2f}</b>",
-        f"Top-N: <b>{STATE['top_n']}</b>",
-    ]
-    if lf:
-        text.append(f"Last file: <code>{lf.name}</code> ({human_ts(lf.stat().st_mtime)})")
-    else:
-        text.append("Last file: —")
-    await update.effective_message.reply_html("\n".join(text), reply_markup=kb_home())
-
-
-async def on_set_threshold(update: Update, context: CallbackContext):
-    val = None
-    if context.args:
-        val = parse_float(context.args[0])
-    if val is None:
-        await update.effective_message.reply_html(
-            "Пришли число от 0 до 1, например: <code>/set_threshold 0.35</code>",
-            reply_markup=kb_home(),
-        )
-        return
-    val = max(0.0, min(1.0, val))
-    STATE["threshold"] = val
-    await update.effective_message.reply_html(fmt_ok(f"Threshold = {val:.2f}"), reply_markup=kb_home())
-
-
-async def on_set_topn(update: Update, context: CallbackContext):
-    n = None
-    if context.args:
+    parts: List[pd.DataFrame] = []
+    for p in sorted(all_paths):
         try:
-            n = int(context.args[0])
-        except Exception:
-            n = None
-    if n is None or n <= 0:
-        await update.effective_message.reply_html(
-            "Пришли положительное число, например: <code>/set_notify_top_n 20</code>",
-            reply_markup=kb_home(),
-        )
-        return
-    STATE["top_n"] = n
-    await update.effective_message.reply_html(fmt_ok(f"Top-N = {n}"), reply_markup=kb_home())
+            for df in read_any_table(p):
+                mapping = infer_schema(df)
+                ok, missing = validate_mapping(mapping)
+                if not ok:
+                    continue
+                df_norm = normalize_df(df, mapping)
+                if len(df_norm):
+                    parts.append(df_norm)
+        except Exception as e:
+            log.exception("Failed to read %s: %s", p, e)
+            continue
+
+    if not parts:
+        return None
+
+    big = pd.concat(parts, ignore_index=True)
+    agg = (
+        big.sort_values("last_event_at")
+           .groupby("email", as_index=False)
+           .agg({
+               "user_id": "last",
+               "last_event_at": "max",
+               "events_28d": "max",
+               "quiz_avg": "mean",
+           })
+    )
+    return agg
 
 
-async def on_schedule(update: Update, context: CallbackContext):
-    if len(context.args) != 2:
-        await update.effective_message.reply_html(
-            "Формат: <code>/schedule_every &lt;days&gt; &lt;HH:MM&gt;</code>",
-            reply_markup=kb_home(),
-        )
-        return
+# =========================
+# SCORING (fallback + модель)
+# =========================
+
+_model = None
+
+def try_load_model():
+    global _model
+    if _model is not None:
+        return _model
+    if os.path.isfile(MODEL_PATH):
+        try:
+            import joblib
+            _model = joblib.load(MODEL_PATH)
+            log.info("Model loaded: %s", MODEL_PATH)
+            return _model
+        except Exception as e:
+            log.warning("Can't load model %s: %s. Using heuristic fallback.", MODEL_PATH, e)
+    return None
+
+
+def heuristic_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    days_since -> чем больше, тем риск выше.
+    мало events_28d -> риск выше.
+    низкий quiz_avg -> риск выше.
+    """
+    now = pd.Timestamp.now(tz=None)
+    days = (now - df["last_event_at"]).dt.days.clip(lower=0).astype(float)
+
+    # нормировки
+    d = (days / 60.0).clip(0, 1)                  # 60+ дней = max
+    e = (1.0 - (df["events_28d"] / 20.0).clip(0, 1))  # 0 событий = 1 (плохо), 20+ = 0
+    q = (1.0 - (df["quiz_avg"] / 100.0).clip(0, 1))   # 0% = 1 (плохо), 100% = 0
+
+    risk = 0.6 * d + 0.25 * e + 0.15 * q
+    out = df.copy()
+    out["risk"] = risk.clip(0, 1)
+
+    out["why"] = []
+    msgs = []
+    for i in range(len(out)):
+        reasons = []
+        if days.iloc[i] >= 20:
+            reasons.append(f"нет активности {int(days.iloc[i])}дн")
+        if df["events_28d"].iloc[i] <= 2:
+            reasons.append(f"мало событий за 28д ({int(df['events_28d'].iloc[i])})")
+        if df["quiz_avg"].iloc[i] <= 60:
+            reasons.append(f"низкие квизы (avg ~{int(df['quiz_avg'].iloc[i])})")
+        msgs.append("; ".join(reasons) if reasons else "сигналов немного")
+    out["why"] = msgs
+    return out
+
+
+def score_students(df: pd.DataFrame) -> pd.DataFrame:
+    mdl = try_load_model()
+    if mdl is None:
+        return heuristic_score(df)
+    # если есть модель, подготовим feature matrix
+    now = pd.Timestamp.now(tz=None)
+    X = pd.DataFrame({
+        "days_since": (now - df["last_event_at"]).dt.days.clip(lower=0).astype(float),
+        "events_28d": df["events_28d"].astype(float),
+        "quiz_avg": df["quiz_avg"].astype(float),
+    })
     try:
-        days = int(context.args[0])
-        hh, mm = map(int, context.args[1].split(":"))
-    except Exception:
-        await update.effective_message.reply_html(
-            "Формат: <code>/schedule_every 7 10:00</code>",
-            reply_markup=kb_home(),
-        )
-        return
+        p = mdl.predict_proba(X)[:, 1]
+    except Exception as e:
+        log.warning("Model failed, fallback to heuristic: %s", e)
+        return heuristic_score(df)
 
-    if SCHED.running:
-        SCHED.remove_all_jobs()
+    out = df.copy()
+    out["risk"] = pd.Series(p).clip(0, 1)
+    # краткое объяснение всё равно сгенерим из правил
+    return heuristic_score(out) if "why" not in out.columns else out
+
+
+# =========================
+# UX: KEYBOARD & SPINNER
+# =========================
+
+def build_menu() -> InlineKeyboardMarkup:
+    rows = []
+    if has_data():
+        rows.append([
+            InlineKeyboardButton("▶️ Запустить /run", callback_data="run"),
+            InlineKeyboardButton("📊 Статус", callback_data="status"),
+        ])
+        rows.append([
+            InlineKeyboardButton("⚙️ Порог риска", callback_data="threshold"),
+            InlineKeyboardButton("🏅 Top-N", callback_data="topn"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🧹 Очистить выгрузки", callback_data="clear"),
+            InlineKeyboardButton("🆘 Помощь", callback_data="help"),
+        ])
     else:
-        SCHED.start()
+        rows.append([
+            InlineKeyboardButton("📊 Статус", callback_data="status"),
+            InlineKeyboardButton("🆘 Помощь", callback_data="help"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🧹 Очистить выгрузки", callback_data="clear"),
+        ])
+    return InlineKeyboardMarkup(rows)
 
-    async def job():
+
+async def spinner(context: ContextTypes.DEFAULT_TYPE, message: Message, stop_event: asyncio.Event, base_text: str):
+    frames = ["⏳", "⏳.", "⏳..", "⏳..."]
+    i = 0
+    while not stop_event.is_set():
         try:
-            await _run_core(update, context, silent=True)
-        except Exception:
-            log.exception("Scheduled job failed")
-
-    SCHED.add_job(job, "interval", days=days, next_run_time=None, hour=hh, minute=mm)
-    await update.effective_message.reply_html(
-        fmt_ok(f"Периодический запуск раз в {days} дн., в {hh:02d}:{mm:02d}"),
-        reply_markup=kb_home(),
-    )
-
-
-async def on_cancel_schedule(update: Update, context: CallbackContext):
-    if SCHED.running:
-        SCHED.remove_all_jobs()
-    await update.effective_message.reply_html(fmt_ok("Расписание выключено"), reply_markup=kb_home())
-
-
-async def on_clear_uploads(update: Update, context: CallbackContext):
-    cnt = 0
-    for p in UPLOAD_DIR.glob("*"):
-        try:
-            p.unlink()
-            cnt += 1
+            await message.edit_text(f"{base_text}\n{frames[i % len(frames)]}", reply_markup=build_menu())
         except Exception:
             pass
-    await update.effective_message.reply_html(
-        fmt_ok(f"Удалено файлов: {cnt}"), reply_markup=kb_home()
+        i += 1
+        await asyncio.sleep(1.0)
+    # финальное погашение делает вызывающий код
+
+
+# =========================
+# HANDLERS
+# =========================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Привет! Я бот алёртов по оттоку LMS.\n"
+        "Пришли CSV/XLSX/ZIP выгрузки — я их сохраню и подскажу, что дальше.\n\n"
+        "Пока нет файлов — кнопка «Запустить» скрыта."
+        if not has_data()
+        else "Файлы есть — можно запустить скоринг."
     )
+    await update.message.reply_text(text, reply_markup=build_menu())
 
 
-async def on_document(update: Update, context: CallbackContext):
-    doc = update.message.document
-    if not doc:
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    model_state = "ok" if os.path.isfile(MODEL_PATH) else "fallback"
+    cfg_state = "ok" if os.path.isfile(CONFIG_PATH) else "missing"
+    exports = UPLOADS_DIR
+    schedule = "None"  # если подключишь APScheduler cron — выведем здесь
+
+    text = (
+        "🧾 Статус:\n"
+        f"Model: {os.path.basename(MODEL_PATH)} ({model_state})\n"
+        f"Config: {os.path.basename(CONFIG_PATH)} ({cfg_state})\n"
+        f"Exports: {exports}\n"
+        f"Threshold: {RISK_THRESHOLD:.2f} • Top-N: {NOTIFY_TOP_N}\n"
+        f"Schedule: {schedule}"
+    )
+    await update.message.reply_text(text, reply_markup=build_menu())
+
+
+async def cmd_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global RISK_THRESHOLD
+    try:
+        val = float(context.args[0])
+        assert 0.0 <= val <= 1.0
+        RISK_THRESHOLD = val
+        await update.message.reply_text(f"OK. Новый порог риска: {RISK_THRESHOLD:.2f}", reply_markup=build_menu())
+    except Exception:
+        await update.message.reply_text("Использование: /set_threshold <0..1>", reply_markup=build_menu())
+
+
+async def cmd_set_topn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global NOTIFY_TOP_N
+    try:
+        val = int(context.args[0])
+        assert val >= 1
+        NOTIFY_TOP_N = val
+        await update.message.reply_text(f"OK. Новый Top-N: {NOTIFY_TOP_N}", reply_markup=build_menu())
+    except Exception:
+        await update.message.reply_text("Использование: /set_notify_top_n <N>", reply_markup=build_menu())
+
+
+async def clear_uploads_dir() -> int:
+    cnt = 0
+    if os.path.isdir(UPLOADS_DIR):
+        for root, _, files in os.walk(UPLOADS_DIR):
+            for f in files:
+                if f.lower().endswith((".csv", ".xlsx", ".xls", ".zip")):
+                    try:
+                        os.remove(os.path.join(root, f))
+                        cnt += 1
+                    except Exception:
+                        pass
+    return cnt
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = await clear_uploads_dir()
+    await update.message.reply_text(f"🧹 Очищено файлов: {n}\nПришли новые выгрузки.", reply_markup=build_menu())
+
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.document:
         return
-    if not any(doc.file_name.lower().endswith(ext) for ext in (".csv", ".xlsx", ".xls")):
-        await update.message.reply_html(
-            fmt_warn("Поддерживаются только CSV/XLSX"), reply_markup=kb_home()
+    doc = update.message.document
+    name = doc.file_name or "file"
+    if not name.lower().endswith((".csv", ".xlsx", ".xls", ".zip")):
+        await update.message.reply_text("Поддерживаю CSV/XLSX/ZIP.", reply_markup=build_menu())
+        return
+
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        dest = os.path.join(UPLOADS_DIR, f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}_{name}")
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        await file.download_to_drive(dest)
+        await update.message.reply_text(
+            f"✅ Файл сохранён:\n{dest}\n"
+            f"{'Можешь запускать /run.' if has_data() else 'Пришли ещё нужные файлы.'}",
+            reply_markup=build_menu(),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при сохранении: {type(e).__name__}: {e}", reply_markup=build_menu())
+
+
+def _format_alerts_table(df: pd.DataFrame, top_n: int) -> str:
+    lines = []
+    total = len(df)
+    show = min(top_n, total)
+    lines.append(f"🔔 Всего алёртов: {show}/{total}")
+    for i, row in enumerate(df.head(show).itertuples(index=False), 1):
+        p = f"{row.risk:.2f}"
+        email = row.email
+        why = getattr(row, "why", "")
+        lines.append(f"{i}. {email} — p={p} — {why}")
+    return "\n".join(lines)
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_data():
+        await update.message.reply_text(
+            "Пока нет выгрузок — пришли CSV/XLSX/ZIP.\n"
+            "Достаточно одного файла с колонками `email` и `last_event_at`.",
+            reply_markup=build_menu(),
         )
         return
 
-    f = await doc.get_file()
-    ts_name = f"{datetime.utcnow():%Y-%m-%dT%H-%M-%S}_{doc.file_name}"
-    dest = UPLOAD_DIR / ts_name
-    await f.download_to_drive(str(dest))
-    await update.message.reply_html(
-        fmt_ok("Файл сохранён:")
-        + f"\n<code>{dest}</code>"
-        + "\n\nМожешь нажать «Запустить /run».",
-        reply_markup=kb_home(),
-    )
+    # спиннер
+    status_msg = await update.message.reply_text("Запускаю скоринг…", reply_markup=build_menu())
+    stop_event = asyncio.Event()
+    spin_task = asyncio.create_task(spinner(context, status_msg, stop_event, "Запускаю скоринг"))
 
-
-async def _run_core(update: Update, context: CallbackContext, silent: bool = False):
-    thr = STATE["threshold"]
-    topn = STATE["top_n"]
-
-    async def work():
-        if USE_EXTERNAL_RUNNER:
-            # подключить внешний раннер при необходимости
-            res, _ = await run_external_runner(thr, topn)
-        else:
-            res, _ = run_builtin_scoring(thr, topn)
-        return res
-
-    if silent:
-        # для расписания без спиннера
-        try:
-            res = await work()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=res,
-                parse_mode=constants.ParseMode.HTML,
-                reply_markup=kb_home(),
+    try:
+        df = load_current_batch(UPLOADS_DIR)
+        if df is None or df.empty:
+            stop_event.set()
+            await asyncio.sleep(0.1)
+            await status_msg.edit_text(
+                "❌ Не удалось определить структуру выгрузок.\n"
+                "Проверь, что есть колонки вроде `email` и `last_event_at`, "
+                "или пришли другой файл.",
+                reply_markup=build_menu(),
             )
-        except Exception as e:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=fmt_err("Ошибка в расписании") + f"\n<code>{e}</code>",
-                parse_mode=constants.ParseMode.HTML,
-                reply_markup=kb_home(),
-            )
-        return
+            return
 
-    await run_with_progress(update, context, "Запускаю скоринг", work)
+        scored = score_students(df)
+        # фильтр по порогу и сортировка
+        alerts = (
+            scored[scored["risk"] >= RISK_THRESHOLD]
+            .sort_values("risk", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        text = _format_alerts_table(alerts, NOTIFY_TOP_N) if not alerts.empty else "✅ Рисковых студентов не найдено."
+        stop_event.set()
+        await asyncio.sleep(0.1)
+        await status_msg.edit_text(text, reply_markup=build_menu())
+
+    except Exception as e:
+        log.exception("Run failed: %s", e)
+        stop_event.set()
+        await asyncio.sleep(0.1)
+        await status_msg.edit_text(
+            f"❌ Ошибка во время обработки: {type(e).__name__}: {e}",
+            reply_markup=build_menu(),
+        )
 
 
-async def on_run(update: Update, context: CallbackContext):
-    await _run_core(update, context, silent=False)
-
-
-# -------------------- Inline buttons --------------------
-
-async def on_cb(update: Update, context: CallbackContext):
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
+    fake_update = Update(update.update_id, message=q.message)
 
-    # «домой»
-    if data == "HOME":
-        await q.edit_message_text(
-            "Выбирай действие:", parse_mode=constants.ParseMode.HTML, reply_markup=kb_home()
+    if data == "run":
+        await cmd_run(fake_update, context)
+    elif data == "status":
+        await cmd_status(fake_update, context)
+    elif data == "clear":
+        await cmd_clear(fake_update, context)
+    elif data == "threshold":
+        await q.message.edit_text(
+            f"Текущий порог риска: {RISK_THRESHOLD:.2f}\n"
+            f"Поменять: `/set_threshold 0.4`", parse_mode="Markdown", reply_markup=build_menu()
         )
-        return
-
-    if data == "RUN":
-        # запускаем обычный /run
-        fake_update = Update(update.update_id, message=q.message)  # reuse chat
-        await on_run(fake_update, context)
-        return
-
-    if data == "STATUS":
-        fake_update = Update(update.update_id, message=q.message)
-        await on_status(fake_update, context)
-        return
-
-    if data == "HELP":
-        fake_update = Update(update.update_id, message=q.message)
-        await on_help(fake_update, context)
-        return
-
-    if data == "CLEAR":
-        fake_update = Update(update.update_id, message=q.message)
-        await on_clear_uploads(fake_update, context)
-        return
-
-    if data == "SET_THR":
-        await q.edit_message_text(
-            "Введи команду, например: <code>/set_threshold 0.30</code>",
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=kb_back(),
+    elif data == "topn":
+        await q.message.edit_text(
+            f"Текущий Top-N: {NOTIFY_TOP_N}\n"
+            f"Поменять: `/set_notify_top_n 30`", parse_mode="Markdown", reply_markup=build_menu()
         )
-        return
-
-    if data == "SET_TOPN":
-        await q.edit_message_text(
-            "Введи команду, например: <code>/set_notify_top_n 20</code>",
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=kb_back(),
+    elif data == "help":
+        await q.message.edit_text(
+            "Команды:\n"
+            "/run — запустить скоринг по последним выгрузкам\n"
+            "/status — текущая конфигурация\n"
+            "/set_threshold <0..1>\n"
+            "/set_notify_top_n <N>\n"
+            "/clear_uploads — удалить загруженные файлы",
+            reply_markup=build_menu(),
         )
-        return
+    else:
+        await q.message.edit_text("Неизвестная команда.", reply_markup=build_menu())
 
 
-# -------------------- Errors --------------------
-
-async def on_error(update: object, context: CallbackContext) -> None:
-    log.exception("Unhandled error")
-    try:
-        chat_id = None
-        if isinstance(update, Update) and update.effective_chat:
-            chat_id = update.effective_chat.id
-        if chat_id:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=fmt_err("Непредвиденная ошибка")
-                + "\n\n"
-                + f"<code>{type(context.error).__name__}: {context.error}</code>",
-                parse_mode=constants.ParseMode.HTML,
-                reply_markup=kb_home(),
-            )
-    except Exception:
-        pass
-
-
-# -------------------- Main --------------------
+# =========================
+# BOOT
+# =========================
 
 def main():
     log.info("Bot started.")
-    app: Application = ApplicationBuilder().token(TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(TG_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(CommandHandler("help", on_help))
-    app.add_handler(CommandHandler("version", on_version))
-    app.add_handler(CommandHandler("status", on_status))
-    app.add_handler(CommandHandler("run", on_run))
-    app.add_handler(CommandHandler("set_threshold", on_set_threshold))
-    app.add_handler(CommandHandler("set_notify_top_n", on_set_topn))
-    app.add_handler(CommandHandler("schedule_every", on_schedule))
-    app.add_handler(CommandHandler("cancel_schedule", on_cancel_schedule))
-    app.add_handler(CommandHandler("clear_uploads", on_clear_uploads))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("run", cmd_run))
+    application.add_handler(CommandHandler("set_threshold", cmd_set_threshold))
+    application.add_handler(CommandHandler("set_notify_top_n", cmd_set_topn))
+    application.add_handler(CommandHandler("clear_uploads", cmd_clear))
+    application.add_handler(CallbackQueryHandler(on_button))
 
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(CallbackQueryHandler(on_cb))
+    application.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
-    app.add_error_handler(on_error)
-
-    app.run_polling(close_loop=False)
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
