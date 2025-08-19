@@ -1,6 +1,6 @@
 # tg_churn_bot.py
 # Telegram-бот для алёртов по оттоку LMS.
-# v2.2 — autodetect(schema), robust events→features, UX spinner & nice errors
+# v2.3 — safe edit (fallback), autodetect(schema), robust events→features, UX spinner & nice errors
 
 import os
 import io
@@ -14,6 +14,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -36,9 +37,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ----------------------- UX: Keyboards ----------------
 def make_keyboard(has_files: bool) -> ReplyKeyboardMarkup:
-    """
-    Показываем 'Запустить /run' только если есть валидные выгрузки.
-    """
     row1 = []
     if has_files:
         row1.append(KeyboardButton("🚀 Запустить /run"))
@@ -54,6 +52,16 @@ def make_keyboard(has_files: bool) -> ReplyKeyboardMarkup:
     rows.append(row3)
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
+# ---------- helpers: safe message edit ----------
+async def safe_edit(msg, text: str):
+    """Редактируем сообщение. Если нельзя — отправляем новое, чтобы не падать."""
+    try:
+        await msg.edit_text(text)
+    except BadRequest:
+        try:
+            await msg.chat.send_message(text)
+        except Exception:
+            pass
 
 # ----------------------- Schema detection -------------
 EMAIL_SYNONYMS = ["email", "user_id", "login", "mail", "e-mail", "user"]
@@ -64,7 +72,6 @@ def _find_email_col(df: pd.DataFrame) -> str | None:
     for key in EMAIL_SYNONYMS:
         if key in low:
             return low[key]
-    # эвристика по содержимому
     for c in cols:
         try:
             if df[c].astype(str).str.contains("@").mean() > 0.5:
@@ -79,7 +86,6 @@ def _find_ts_col(df: pd.DataFrame) -> str | None:
     for key in candidates:
         if key in low:
             return low[key]
-    # эвристика по типу
     for c in df.columns:
         try:
             pd.to_datetime(df[c], errors="raise")
@@ -90,10 +96,8 @@ def _find_ts_col(df: pd.DataFrame) -> str | None:
 
 def detect_schema(df: pd.DataFrame) -> str:
     cols = {c.lower() for c in df.columns}
-    # уже готовые признаки
     if {"email", "last_event_at", "events_28d", "quiz_avg"}.issubset(cols):
         return "features"
-    # вероятный лог событий
     if _find_email_col(df) and _find_ts_col(df):
         return "events"
     return "unknown"
@@ -110,7 +114,6 @@ def build_features_from_events(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     raw["timestamp"] = pd.to_datetime(raw["timestamp"], errors="coerce")
     raw = raw.dropna(subset=["email", "timestamp"])
 
-    # референс — max(timestamp) в выгрузке (устойчиво для тестов/старых дампов)
     ref_now = raw["timestamp"].max()
     win_from = ref_now - timedelta(days=28)
 
@@ -121,7 +124,6 @@ def build_features_from_events(dfs: list[pd.DataFrame]) -> pd.DataFrame:
         .rename("events_28d")
     )
 
-    # квизы (если есть)
     evt_col = next((c for c in ["event_type", "event", "type"] if c in raw.columns), None)
     score_col = next((c for c in ["score", "quiz_score"] if c in raw.columns), None)
 
@@ -136,7 +138,6 @@ def build_features_from_events(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     else:
         quiz_avg = pd.Series(dtype=float, name="quiz_avg")
 
-    # безопасная сборка
     all_emails = pd.Index(sorted(raw["email"].unique()), name="email")
     out = pd.concat([last_event, events_28d, quiz_avg], axis=1).reindex(all_emails)
     out = out.reset_index()
@@ -145,7 +146,6 @@ def build_features_from_events(dfs: list[pd.DataFrame]) -> pd.DataFrame:
     out["quiz_avg"]   = out["quiz_avg"].fillna(0)
     out["last_event_at"] = pd.to_datetime(out["last_event_at"]).dt.strftime("%Y-%m-%dT%H:%M:%S")
     return out[["email", "last_event_at", "events_28d", "quiz_avg"]]
-
 
 # ----------------------- File loading -----------------
 def _read_csv_bytes(b: bytes) -> pd.DataFrame:
@@ -156,10 +156,6 @@ def _read_xlsx_bytes(b: bytes) -> list[pd.DataFrame]:
     return [xl.parse(s) for s in xl.sheet_names]
 
 def load_tables_from_path(path: str) -> list[pd.DataFrame]:
-    """
-    Поддержка CSV / XLSX / ZIP (внутри — csv/xlsx).
-    Возвращает список датафреймов.
-    """
     path_low = path.lower()
     dfs: list[pd.DataFrame] = []
 
@@ -182,14 +178,12 @@ def load_tables_from_path(path: str) -> list[pd.DataFrame]:
     else:
         raise ValueError(f"Неизвестный формат файла: {os.path.basename(path)}")
 
-    # нормализация заголовков
     norm = []
     for d in dfs:
         d = d.copy()
         d.columns = [str(c).strip() for c in d.columns]
         norm.append(d)
     return norm
-
 
 # ----------------------- Scoring ----------------------
 _model = None
@@ -213,19 +207,11 @@ def _days_inactive(last_event_at: str, ref: datetime | None = None) -> int:
         return 9999
 
 def rule_based_score(df: pd.DataFrame) -> pd.Series:
-    """
-    Аккуратный бейзлайн, если нет модели.
-    p ~ от 0 до 1. Учитываем:
-      - дни без активности,
-      - малое число событий за 28д,
-      - низкий средний балл квизов.
-    """
     ref_now = datetime.utcnow()
     days = df["last_event_at"].apply(lambda s: _days_inactive(s, ref_now))
     events = df.get("events_28d", pd.Series([0]*len(df)))
     quiz = df.get("quiz_avg", pd.Series([0]*len(df))).fillna(0)
 
-    # нормировки / веса
     p = (
         (days.clip(0, 60) / 60) * 0.6 +
         ((10 - events.clip(0, 10)) / 10) * 0.3 +
@@ -236,14 +222,10 @@ def rule_based_score(df: pd.DataFrame) -> pd.Series:
 def predict_scores(features: pd.DataFrame) -> pd.Series:
     _load_model_if_any()
     if _model is not None:
-        # ожидаем порядок: нужно подогнать к признакам модели, если используешь pkl
-        # для универсальности — fallback к бейзлайну при ошибке
         try:
             X = features.copy()
-            # возможные приведения типов
             X["events_28d"] = X["events_28d"].astype(float)
             X["quiz_avg"]   = X["quiz_avg"].astype(float)
-            # last_event_at → days_inactive
             X["days_inactive"] = X["last_event_at"].apply(lambda s: _days_inactive(s))
             use_cols = [c for c in ["days_inactive", "events_28d", "quiz_avg"] if c in X.columns]
             p = pd.Series(_model.predict_proba(X[use_cols])[:, 1], index=features.index)
@@ -252,8 +234,7 @@ def predict_scores(features: pd.DataFrame) -> pd.Series:
             pass
     return rule_based_score(features)
 
-
-# ----------------------- Helpers ----------------------
+# ----------------------- Misc helpers -----------------
 def has_any_valid_upload() -> bool:
     files = [f for f in os.listdir(UPLOAD_DIR) if not f.startswith(".")]
     return len(files) > 0
@@ -276,7 +257,6 @@ def clear_uploads():
 def short_trace(exc: Exception) -> str:
     tb = traceback.format_exc(limit=4)
     return "\n".join(tb.strip().splitlines()[-4:])
-
 
 # ----------------------- Handlers ---------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,7 +317,6 @@ async def clean_btn(update: Update, context: CallbackContext):
 async def handle_text(update: Update, context: CallbackContext):
     text = (update.message.text or "").strip()
 
-    # ожидание числовых значений
     if context.chat_data.pop("await_threshold", False):
         try:
             v = float(text.replace(",", "."))
@@ -356,7 +335,6 @@ async def handle_text(update: Update, context: CallbackContext):
             await update.message.reply_text("Не понял число. Пример: 20", reply_markup=make_keyboard(has_any_valid_upload()))
         return
 
-    # кнопки/команды
     low = text.lower()
     if "запустить" in low or low.startswith("/run"):
         await run_cmd(update, context)
@@ -391,7 +369,10 @@ async def handle_document(update: Update, context: CallbackContext):
             reply_markup=make_keyboard(True),
         )
     except Exception as e:
-        await update.message.replyText(f"🔴 Ошибка при сохранении: {e}\n{short_trace(e)}", reply_markup=make_keyboard(has_any_valid_upload()))
+        await update.message.reply_text(
+            f"🔴 Ошибка при сохранении: {e}\n{short_trace(e)}",
+            reply_markup=make_keyboard(has_any_valid_upload())
+        )
 
 async def run_cmd(update: Update, context: CallbackContext):
     files = list_uploaded_paths()
@@ -399,57 +380,42 @@ async def run_cmd(update: Update, context: CallbackContext):
         await update.message.reply_text("Сначала пришли выгрузку (CSV/XLSX/ZIP).", reply_markup=make_keyboard(False))
         return
 
-    # спиннер
     msg = await update.message.reply_text("⏳ Запускаю скоринг…", reply_markup=make_keyboard(True))
 
     try:
-        # читаем все таблицы
         all_dfs: list[pd.DataFrame] = []
         for p in files:
             all_dfs.extend(load_tables_from_path(p))
 
-        # определяем схемы и готовим признаки
         schemas = [detect_schema(df) for df in all_dfs]
         if any(k == "features" for k in schemas):
             feats = [df for df, k in zip(all_dfs, schemas) if k == "features"]
             features = pd.concat(feats, ignore_index=True)
-            await context.bot.edit_message_text(
-                chat_id=msg.chat_id, message_id=msg.message_id,
-                text="🔎 Найдены готовые признаки. Идёт скоринг…"
-            )
+            await safe_edit(msg, "🔎 Найдены готовые признаки. Идёт скоринг…")
         elif any(k == "events" for k in schemas):
             evts = [df for df, k in zip(all_dfs, schemas) if k == "events"]
-            await context.bot.edit_message_text(
-                chat_id=msg.chat_id, message_id=msg.message_id,
-                text="🔨 Обнаружен лог событий. Строю признаки…"
-            )
+            await safe_edit(msg, "🔨 Обнаружен лог событий. Строю признаки…")
             features = build_features_from_events(evts)
         else:
-            await context.bot.edit_message_text(
-                chat_id=msg.chat_id, message_id=msg.message_id,
-                text=("🔴 Не распознал формат выгрузки.\n"
-                      "Нужен либо features-CSV: email,last_event_at,events_28d,quiz_avg;\n"
-                      "либо events-лог: email/user_id + timestamp (+event_type,score).")
+            await safe_edit(
+                msg,
+                "🔴 Не распознал формат выгрузки.\n"
+                "Нужен либо features-CSV: email,last_event_at,events_28d,quiz_avg;\n"
+                "либо events-лог: email/user_id + timestamp (+event_type,score)."
             )
             return
 
-        # скоринг
-        await context.bot.edit_message_text(
-            chat_id=msg.chat_id, message_id=msg.message_id,
-            text="🤖 Считаю вероятности…"
-        )
+        await safe_edit(msg, "🤖 Считаю вероятности…")
         p = predict_scores(features)
         features = features.copy()
         features["p"] = p
 
-        # параметры вывода
         threshold = context.chat_data.get("threshold", DEFAULT_THRESHOLD)
         topn = context.chat_data.get("topn", DEFAULT_TOP_N)
 
         risky = features.sort_values("p", ascending=False)
         top_rows = risky.head(topn)
 
-        # форматируем вывод
         alerts = []
         cnt_alerts = 0
         ref_now = datetime.utcnow()
@@ -471,15 +437,11 @@ async def run_cmd(update: Update, context: CallbackContext):
         head = f"🔔 Всего алёртов: {cnt_alerts}/{len(top_rows)}"
         body = "\n".join([f"{i+1}. {s}" for i, s in enumerate(alerts)]) if alerts else "нет"
         final = f"{head}\n{body}"
-        await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=final)
+        await safe_edit(msg, final)
 
     except Exception as e:
         txt = f"🔴 Ошибка во время обработки: {e}\n{short_trace(e)}"
-        try:
-            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=txt)
-        except Exception:
-            await update.message.reply_text(txt, reply_markup=make_keyboard(has_any_valid_upload()))
-
+        await safe_edit(msg, txt)
 
 # ----------------------- App bootstrap ----------------
 def main():
@@ -493,13 +455,11 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("run", run_cmd))
 
-    # кнопки
     app.add_handler(MessageHandler(filters.Regex("^⚙️ Порог риска$"), set_threshold_btn))
     app.add_handler(MessageHandler(filters.Regex("^🥇 Топ-N$"), set_topn_btn))
     app.add_handler(MessageHandler(filters.Regex("^🧹 Очистить выгрузки$"), clean_btn))
     app.add_handler(MessageHandler(filters.Regex("^🆘 Помощь$"), help_cmd))
 
-    # документы и текст
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
